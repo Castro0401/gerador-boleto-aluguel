@@ -1,6 +1,8 @@
 import sqlite3
 from datetime import date
 import io
+import json
+import hashlib
 
 import streamlit as st
 
@@ -82,6 +84,13 @@ def display_to_mes(display_mm_aaaa: str) -> str:
         return display_mm_aaaa
 
 
+def payload_fingerprint(payload: dict) -> str:
+    # fingerprint para garantir "salvou antes de gerar PDF"
+    # ordena chaves, transforma em JSON estável e hasheia
+    stable = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+
 # -----------------------------
 # DB
 # -----------------------------
@@ -93,7 +102,6 @@ APT2_ID = 2
 APT1_APELIDO = "Barra Village Prime - Recreio"
 APT2_APELIDO = "Jardim Oceânico - Maria Paula"
 
-# Você pode ajustar os defaults aqui (se quiser)
 APT1_IMOVEL_DEFAULT = "Barra Village Prime"
 APT1_BAIRRO_DEFAULT = "Recreio – Rio de Janeiro/RJ"
 
@@ -118,16 +126,14 @@ def colnames(cur, table: str) -> list:
 def init_db():
     """
     Cria o modelo novo e MIGRA automaticamente se detectar DB antigo no Streamlit Cloud.
-    O erro que você teve acontece quando existe tabela 'lancamentos' antiga sem apartamento_id.
     """
     with get_conn() as conn:
         cur = conn.cursor()
 
-        # 1) Se existir lancamentos antigo (sem apartamento_id), MIGRAR antes de usar
+        # 1) Migrar lancamentos antigo (sem apartamento_id)
         if table_exists(cur, "lancamentos"):
             cols = colnames(cur, "lancamentos")
             if "apartamento_id" not in cols:
-                # migração: renomeia, cria nova, copia, drop/rename
                 cur.execute("ALTER TABLE lancamentos RENAME TO lancamentos_old")
 
                 cur.execute("""
@@ -164,16 +170,12 @@ def init_db():
                 """)
 
                 old_cols = colnames(cur, "lancamentos_old")
-
-                # mapeamentos compatíveis
                 def has(c): return c in old_cols
 
-                # taxa_admin/desconto antigos -> consumo_agua/outros_descontos
                 consumo_expr = "consumo_agua" if has("consumo_agua") else ("taxa_admin" if has("taxa_admin") else "0")
                 desconto_expr = "outros_descontos" if has("outros_descontos") else ("desconto" if has("desconto") else "0")
                 seguro_expr = "seguro_incendio" if has("seguro_incendio") else "0"
 
-                # copiar tudo para o APT1 (porque no DB antigo só existia 1 imóvel)
                 cur.execute(f"""
                     INSERT INTO lancamentos (
                         apartamento_id, mes,
@@ -191,8 +193,6 @@ def init_db():
                         '', '', '', '', '', '', ''
                     FROM lancamentos_old
                 """)
-
-                # opcional: manter o old (não apaga). Mas para simplificar, vamos dropar:
                 cur.execute("DROP TABLE lancamentos_old")
 
         # 2) Criar tabelas novas (se não existirem)
@@ -224,7 +224,7 @@ def init_db():
             )
         """)
 
-        # 3) Seed dos 2 imóveis fixos (sempre existirão)
+        # 3) Seed dos 2 imóveis fixos
         cur.execute("""
             INSERT OR IGNORE INTO apartamentos (id, apelido, imovel, bairro)
             VALUES (?, ?, ?, ?)
@@ -239,7 +239,7 @@ def init_db():
         cur.execute("INSERT OR IGNORE INTO configs (apartamento_id, vencimento_dia) VALUES (?, 5)", (APT1_ID,))
         cur.execute("INSERT OR IGNORE INTO configs (apartamento_id, vencimento_dia) VALUES (?, 5)", (APT2_ID,))
 
-        # 5) Se existir config antiga (tabela singular), migra para configs do apt1 (uma vez)
+        # 5) Migrar config antiga singular -> configs do apt1 (se existir)
         if table_exists(cur, "config"):
             old_cfg_cols = colnames(cur, "config")
             if "id" in old_cfg_cols:
@@ -498,6 +498,13 @@ def upsert_lancamento(apt_id: int, mes: str, data: dict):
         conn.commit()
 
 
+def delete_lancamento(apt_id: int, mes: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM lancamentos WHERE apartamento_id=? AND mes=?", (apt_id, mes))
+        conn.commit()
+
+
 def list_lancamentos(apt_id: int):
     with get_conn() as conn:
         cur = conn.cursor()
@@ -661,7 +668,13 @@ if st.sidebar.button("🚪 Sair"):
 
 st.caption(f"Imóvel ativo: **{apelido_sel}**")
 
+# controle de "salvou antes de gerar PDF"
+# guardamos (apt_id, mes, fingerprint)
+if "last_saved_key" not in st.session_state:
+    st.session_state["last_saved_key"] = None
+
 tab1, tab2, tab3 = st.tabs(["⚙️ Fixos (Config)", "🗓️ Mês (Valores)", "📚 Histórico"])
+
 
 # -------- Fixos
 with tab1:
@@ -690,7 +703,11 @@ with tab1:
         with colD:
             locatario_doc = st.text_input("Locatário (CPF/CNPJ)", value=cfg.get("locatario_doc") or "")
 
-        vencimento_dia = st.number_input("Dia fixo de vencimento", min_value=1, max_value=28, value=int(cfg.get("vencimento_dia") or 5))
+        vencimento_dia = st.number_input(
+            "Dia fixo de vencimento",
+            min_value=1, max_value=28,
+            value=int(cfg.get("vencimento_dia") or 5)
+        )
 
         st.markdown("### Dados para pagamento")
         c1, c2 = st.columns(2)
@@ -724,7 +741,8 @@ with tab1:
             })
             st.success("Configurações salvas!")
 
-# -------- Mês (Valores) + Observação + Memória
+
+# -------- Mês (Valores) + Observação + Memória + (OBRIGA salvar antes do PDF)
 with tab2:
     st.subheader("Valores do mês")
 
@@ -741,9 +759,18 @@ with tab2:
     def val_obs_row(label, key_val, key_obs, step=10.0):
         c1, c2 = st.columns([1, 1])
         with c1:
-            v = st.number_input(label, min_value=0.0, value=float(base.get(key_val, 0.0)) if base else 0.0, step=step)
+            v = st.number_input(
+                label,
+                min_value=0.0,
+                value=float(base.get(key_val, 0.0)) if base else 0.0,
+                step=step
+            )
         with c2:
-            o = st.text_input("Obs.", value=(base.get(key_obs, "") if base else ""), key=f"{apt_id}_{mes}_{key_obs}")
+            o = st.text_input(
+                "Obs.",
+                value=(base.get(key_obs, "") if base else ""),
+                key=f"{apt_id}_{mes}_{key_obs}"
+            )
         return v, o
 
     aluguel, aluguel_obs = val_obs_row("Aluguel (R$)", "aluguel", "aluguel_obs", step=50.0)
@@ -754,7 +781,7 @@ with tab2:
     outras_taxas, outras_taxas_obs = val_obs_row("Outras taxas (R$)", "outras_taxas", "outras_taxas_obs", step=10.0)
     outros_descontos, outros_descontos_obs = val_obs_row("Outros Descontos (R$)", "outros_descontos", "outros_descontos_obs", step=10.0)
 
-    subtotal = aluguel + condominio + iptu + consumo_agua + seguro_incendio + outras_taxas
+    subtotal = aluguel + condominio + iptu + consumo_agua + seguro_incendio + אחרות_taxas if False else (aluguel + condominio + iptu + consumo_agua + seguro_incendio + outras_taxas)
     total = subtotal - outros_descontos
 
     st.info(
@@ -773,28 +800,37 @@ with tab2:
         "outros_descontos": outros_descontos, "outros_descontos_obs": outros_descontos_obs,
     }
 
+    fp = payload_fingerprint(payload)
+    current_key = f"{apt_id}|{mes}|{fp}"
+    saved_ok = (st.session_state["last_saved_key"] == current_key)
+
     colX, colY = st.columns(2)
     with colX:
         if st.button("💾 Salvar mês"):
             upsert_lancamento(apt_id, mes, payload)
-            st.success(f"Lançamento {mes_to_display(mes)} salvo!")
+            st.session_state["last_saved_key"] = current_key
+            st.success(f"Lançamento {mes_to_display(mes)} salvo! Agora você pode gerar o PDF.")
 
     with colY:
         if st.button("🧾 Gerar PDF do mês"):
-            upsert_lancamento(apt_id, mes, payload)
-            cfg_now = load_config(apt_id)
-            apt_now = get_apartamento(apt_id)
-            lanc_now = get_lancamento(apt_id, mes)
-            pdf_bytes = generate_pdf_bytes(apt_now, cfg_now, lanc_now)
+            # REGRA: só gera se tiver salvo exatamente o que está na tela
+            if not saved_ok:
+                st.error("Para gerar o PDF, primeiro clique em **Salvar mês** (com esses valores).")
+            else:
+                cfg_now = load_config(apt_id)
+                apt_now = get_apartamento(apt_id)
+                lanc_now = get_lancamento(apt_id, mes)
+                pdf_bytes = generate_pdf_bytes(apt_now, cfg_now, lanc_now)
 
-            st.download_button(
-                "⬇️ Baixar PDF",
-                data=pdf_bytes,
-                file_name=f"Boleto_{apelido_sel.replace(' ', '_')}_{mes}.pdf",
-                mime="application/pdf"
-            )
+                st.download_button(
+                    "⬇️ Baixar PDF",
+                    data=pdf_bytes,
+                    file_name=f"Boleto_{apelido_sel.replace(' ', '_')}_{mes}.pdf",
+                    mime="application/pdf"
+                )
 
-# -------- Histórico
+
+# -------- Histórico + (APAGAR LINHA com confirmação)
 with tab3:
     st.subheader("Histórico de meses (por imóvel)")
     rows = list_lancamentos(apt_id)
@@ -825,15 +861,46 @@ with tab3:
         meses = [r["mes"] for r in rows]
         mes_sel = st.selectbox("Selecione o mês", options=meses, format_func=mes_to_display)
 
-        if st.button("Gerar PDF do mês selecionado"):
-            cfg_now = load_config(apt_id)
-            apt_now = get_apartamento(apt_id)
-            lanc_now = get_lancamento(apt_id, mes_sel)
-            pdf_bytes = generate_pdf_bytes(apt_now, cfg_now, lanc_now)
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("Gerar PDF do mês selecionado"):
+                cfg_now = load_config(apt_id)
+                apt_now = get_apartamento(apt_id)
+                lanc_now = get_lancamento(apt_id, mes_sel)
+                pdf_bytes = generate_pdf_bytes(apt_now, cfg_now, lanc_now)
 
-            st.download_button(
-                "⬇️ Baixar PDF",
-                data=pdf_bytes,
-                file_name=f"Boleto_{apelido_sel.replace(' ', '_')}_{mes_sel}.pdf",
-                mime="application/pdf"
-            )
+                st.download_button(
+                    "⬇️ Baixar PDF",
+                    data=pdf_bytes,
+                    file_name=f"Boleto_{apelido_sel.replace(' ', '_')}_{mes_sel}.pdf",
+                    mime="application/pdf"
+                )
+
+        # botão de apagar com confirmação
+        st.divider()
+        st.markdown("### Apagar um mês do histórico")
+
+        if "confirm_delete" not in st.session_state:
+            st.session_state["confirm_delete"] = {"open": False, "mes": None, "apt_id": None}
+
+        with colB:
+            if st.button("🗑️ Apagar mês selecionado"):
+                st.session_state["confirm_delete"] = {"open": True, "mes": mes_sel, "apt_id": apt_id}
+
+        conf = st.session_state["confirm_delete"]
+        if conf["open"] and conf["mes"] == mes_sel and conf["apt_id"] == apt_id:
+            st.warning(f"Tem certeza que deseja apagar **{mes_to_display(mes_sel)}** do histórico? Essa ação não pode ser desfeita.")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("✅ Sim, apagar agora"):
+                    delete_lancamento(apt_id, mes_sel)
+                    st.session_state["confirm_delete"] = {"open": False, "mes": None, "apt_id": None}
+                    # se apagar o mês que estava marcado como "salvo", invalida
+                    if st.session_state.get("last_saved_key", "").startswith(f"{apt_id}|{mes_sel}|"):
+                        st.session_state["last_saved_key"] = None
+                    st.success("Mês apagado com sucesso.")
+                    st.rerun()
+            with c2:
+                if st.button("❌ Cancelar"):
+                    st.session_state["confirm_delete"] = {"open": False, "mes": None, "apt_id": None}
+                    st.info("Ação cancelada.")
