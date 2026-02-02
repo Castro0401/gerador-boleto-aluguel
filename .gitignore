@@ -1,0 +1,6 @@
+@"
+boleto.db
+*.db
+.venv/
+__pycache__/
+"@ | Set-Content .gitignore -Encoding UTF8
