@@ -9,6 +9,49 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 
+# -----------------------------
+# Segurança (gate)
+# -----------------------------
+ALLOWED_CODES = {"133", "735", "169"}
+
+def security_gate():
+    # Estado de autenticação
+    if "auth_ok" not in st.session_state:
+        st.session_state["auth_ok"] = False
+
+    # Se já autenticou, libera
+    if st.session_state["auth_ok"]:
+        return
+
+    # Tela de login (e bloqueia o resto)
+    st.set_page_config(page_title="Acesso restrito", page_icon="🔒", layout="centered")
+    st.title("🔒 Acesso restrito")
+    st.write("Digite os **3 primeiros dígitos do CPF** para acessar.")
+
+    code = st.text_input("Senha (3 dígitos)", max_chars=3, type="password", placeholder="Ex: 133")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Entrar", use_container_width=True):
+            if code in ALLOWED_CODES:
+                st.session_state["auth_ok"] = True
+                st.success("Acesso liberado.")
+                st.rerun()
+            else:
+                st.session_state["auth_ok"] = False
+                st.error("Senha inválida.")
+
+    with col2:
+        if st.button("Limpar", use_container_width=True):
+            st.session_state["auth_ok"] = False
+            st.rerun()
+
+    # Bloqueia qualquer coisa abaixo disso
+    st.stop()
+
+
+# Chame o gate antes de qualquer coisa do app:
+security_gate()
 
 # -----------------------------
 # Utils
