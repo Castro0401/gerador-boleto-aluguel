@@ -23,6 +23,7 @@ st.set_page_config(page_title="Cobrança de Aluguel", page_icon="🧾", layout="
 # -----------------------------
 ALLOWED_CODES = {"133", "735", "169"}
 
+
 def security_gate():
     if "auth_ok" not in st.session_state:
         st.session_state["auth_ok"] = False
@@ -85,8 +86,6 @@ def display_to_mes(display_mm_aaaa: str) -> str:
 
 
 def payload_fingerprint(payload: dict) -> str:
-    # fingerprint para garantir "salvou antes de gerar PDF"
-    # ordena chaves, transforma em JSON estável e hasheia
     stable = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(stable.encode("utf-8")).hexdigest()
 
@@ -130,7 +129,7 @@ def init_db():
     with get_conn() as conn:
         cur = conn.cursor()
 
-        # 1) Migrar lancamentos antigo (sem apartamento_id)
+        # --- Migração: lancamentos antigo (sem apartamento_id) ---
         if table_exists(cur, "lancamentos"):
             cols = colnames(cur, "lancamentos")
             if "apartamento_id" not in cols:
@@ -193,9 +192,10 @@ def init_db():
                         '', '', '', '', '', '', ''
                     FROM lancamentos_old
                 """)
-                cur.execute("DROP TABLE lancamentos_old")
+                cur.execute("DROP TABLE lancancamentos_old".replace("lancancamentos", "lancamentos"))  # só pra garantir sem erro de digitação
+                # (linha acima vira: DROP TABLE lancamentos_old)
 
-        # 2) Criar tabelas novas (se não existirem)
+        # --- Tabelas principais ---
         cur.execute("""
             CREATE TABLE IF NOT EXISTS apartamentos (
                 id INTEGER PRIMARY KEY,
@@ -224,73 +224,15 @@ def init_db():
             )
         """)
 
-        # 3) Seed dos 2 imóveis fixos
-        cur.execute("""
-            INSERT OR IGNORE INTO apartamentos (id, apelido, imovel, bairro)
-            VALUES (?, ?, ?, ?)
-        """, (APT1_ID, APT1_APELIDO, APT1_IMOVEL_DEFAULT, APT1_BAIRRO_DEFAULT))
+        # seed 2 imóveis
+        cur.execute("INSERT OR IGNORE INTO apartamentos (id, apelido, imovel, bairro) VALUES (?, ?, ?, ?)",
+                    (APT1_ID, APT1_APELIDO, APT1_IMOVEL_DEFAULT, APT1_BAIRRO_DEFAULT))
+        cur.execute("INSERT OR IGNORE INTO apartamentos (id, apelido, imovel, bairro) VALUES (?, ?, ?, ?)",
+                    (APT2_ID, APT2_APELIDO, APT2_IMOVEL_DEFAULT, APT2_BAIRRO_DEFAULT))
 
-        cur.execute("""
-            INSERT OR IGNORE INTO apartamentos (id, apelido, imovel, bairro)
-            VALUES (?, ?, ?, ?)
-        """, (APT2_ID, APT2_APELIDO, APT2_IMOVEL_DEFAULT, APT2_BAIRRO_DEFAULT))
-
-        # 4) Garantir configs para ambos
+        # configs
         cur.execute("INSERT OR IGNORE INTO configs (apartamento_id, vencimento_dia) VALUES (?, 5)", (APT1_ID,))
         cur.execute("INSERT OR IGNORE INTO configs (apartamento_id, vencimento_dia) VALUES (?, 5)", (APT2_ID,))
-
-        # 5) Migrar config antiga singular -> configs do apt1 (se existir)
-        if table_exists(cur, "config"):
-            old_cfg_cols = colnames(cur, "config")
-            if "id" in old_cfg_cols:
-                cur.execute("SELECT * FROM config WHERE id=1")
-                row = cur.fetchone()
-                if row:
-                    cols = [d[0] for d in cur.description]
-                    old = dict(zip(cols, row))
-
-                    cur.execute("""
-                        UPDATE apartamentos
-                        SET imovel=?, bairro=?
-                        WHERE id=?
-                    """, (
-                        (old.get("imovel") or APT1_IMOVEL_DEFAULT),
-                        (old.get("bairro") or APT1_BAIRRO_DEFAULT),
-                        APT1_ID
-                    ))
-
-                    cur.execute("""
-                        UPDATE configs SET
-                            locador_nome=?,
-                            locador_doc=?,
-                            locatario_nome=?,
-                            locatario_doc=?,
-                            vencimento_dia=?,
-                            banco=?,
-                            agencia=?,
-                            conta=?,
-                            tipo_conta=?,
-                            titular=?,
-                            titular_doc=?,
-                            pix=?,
-                            contato_comprovante=?
-                        WHERE apartamento_id=?
-                    """, (
-                        old.get("locador_nome", ""),
-                        old.get("locador_doc", ""),
-                        old.get("locatario_nome", ""),
-                        old.get("locatario_doc", ""),
-                        int(old.get("vencimento_dia") or 5),
-                        old.get("banco", ""),
-                        old.get("agencia", ""),
-                        old.get("conta", ""),
-                        old.get("tipo_conta", ""),
-                        old.get("titular", ""),
-                        old.get("titular_doc", ""),
-                        old.get("pix", ""),
-                        old.get("contato_comprovante", ""),
-                        APT1_ID
-                    ))
 
         conn.commit()
 
@@ -655,6 +597,7 @@ apelido_sel = st.sidebar.selectbox(
     options=list(apt_map.keys()),
     index=0 if st.session_state["apt_id"] == APT1_ID else 1
 )
+
 apt_id = apt_map[apelido_sel]
 st.session_state["apt_id"] = apt_id
 
@@ -668,10 +611,9 @@ if st.sidebar.button("🚪 Sair"):
 
 st.caption(f"Imóvel ativo: **{apelido_sel}**")
 
-# controle de "salvou antes de gerar PDF"
-# guardamos (apt_id, mes, fingerprint)
+# controle "salvou antes do PDF"
 if "last_saved_key" not in st.session_state:
-    st.session_state["last_saved_key"] = None
+    st.session_state["last_saved_key"] = ""  # string vazia, nunca None
 
 tab1, tab2, tab3 = st.tabs(["⚙️ Fixos (Config)", "🗓️ Mês (Valores)", "📚 Histórico"])
 
@@ -703,11 +645,7 @@ with tab1:
         with colD:
             locatario_doc = st.text_input("Locatário (CPF/CNPJ)", value=cfg.get("locatario_doc") or "")
 
-        vencimento_dia = st.number_input(
-            "Dia fixo de vencimento",
-            min_value=1, max_value=28,
-            value=int(cfg.get("vencimento_dia") or 5)
-        )
+        vencimento_dia = st.number_input("Dia fixo de vencimento", min_value=1, max_value=28, value=int(cfg.get("vencimento_dia") or 5))
 
         st.markdown("### Dados para pagamento")
         c1, c2 = st.columns(2)
@@ -742,7 +680,7 @@ with tab1:
             st.success("Configurações salvas!")
 
 
-# -------- Mês (Valores) + Observação + Memória + (OBRIGA salvar antes do PDF)
+# -------- Mês (Valores) + OBS + Memória + (OBRIGA salvar antes do PDF)
 with tab2:
     st.subheader("Valores do mês")
 
@@ -781,7 +719,7 @@ with tab2:
     outras_taxas, outras_taxas_obs = val_obs_row("Outras taxas (R$)", "outras_taxas", "outras_taxas_obs", step=10.0)
     outros_descontos, outros_descontos_obs = val_obs_row("Outros Descontos (R$)", "outros_descontos", "outros_descontos_obs", step=10.0)
 
-    subtotal = aluguel + condominio + iptu + consumo_agua + seguro_incendio + אחרות_taxas if False else (aluguel + condominio + iptu + consumo_agua + seguro_incendio + outras_taxas)
+    subtotal = aluguel + condominio + iptu + consumo_agua + seguro_incendio + outras_taxas
     total = subtotal - outros_descontos
 
     st.info(
@@ -813,7 +751,6 @@ with tab2:
 
     with colY:
         if st.button("🧾 Gerar PDF do mês"):
-            # REGRA: só gera se tiver salvo exatamente o que está na tela
             if not saved_ok:
                 st.error("Para gerar o PDF, primeiro clique em **Salvar mês** (com esses valores).")
             else:
@@ -830,7 +767,7 @@ with tab2:
                 )
 
 
-# -------- Histórico + (APAGAR LINHA com confirmação)
+# -------- Histórico + APAGAR (refeito)
 with tab3:
     st.subheader("Histórico de meses (por imóvel)")
     rows = list_lancamentos(apt_id)
@@ -842,7 +779,6 @@ with tab3:
         for r in rows:
             subtotal = r["aluguel"] + r["condominio"] + r["iptu"] + r["consumo_agua"] + r["seguro_incendio"] + r["outras_taxas"]
             total = subtotal - r["outros_descontos"]
-
             table_rows.append({
                 "Mês": mes_to_display(r["mes"]),
                 "Aluguel": brl(r["aluguel"]),
@@ -861,46 +797,36 @@ with tab3:
         meses = [r["mes"] for r in rows]
         mes_sel = st.selectbox("Selecione o mês", options=meses, format_func=mes_to_display)
 
-        colA, colB = st.columns(2)
-        with colA:
-            if st.button("Gerar PDF do mês selecionado"):
-                cfg_now = load_config(apt_id)
-                apt_now = get_apartamento(apt_id)
-                lanc_now = get_lancamento(apt_id, mes_sel)
-                pdf_bytes = generate_pdf_bytes(apt_now, cfg_now, lanc_now)
+        if st.button("Gerar PDF do mês selecionado"):
+            cfg_now = load_config(apt_id)
+            apt_now = get_apartamento(apt_id)
+            lanc_now = get_lancamento(apt_id, mes_sel)
+            pdf_bytes = generate_pdf_bytes(apt_now, cfg_now, lanc_now)
 
-                st.download_button(
-                    "⬇️ Baixar PDF",
-                    data=pdf_bytes,
-                    file_name=f"Boleto_{apelido_sel.replace(' ', '_')}_{mes_sel}.pdf",
-                    mime="application/pdf"
-                )
+            st.download_button(
+                "⬇️ Baixar PDF",
+                data=pdf_bytes,
+                file_name=f"Boleto_{apelido_sel.replace(' ', '_')}_{mes_sel}.pdf",
+                mime="application/pdf"
+            )
 
-        # botão de apagar com confirmação
         st.divider()
-        st.markdown("### Apagar um mês do histórico")
+        st.markdown("### 🗑️ Apagar um mês do histórico")
 
-        if "confirm_delete" not in st.session_state:
-            st.session_state["confirm_delete"] = {"open": False, "mes": None, "apt_id": None}
+        # estado de confirmação
+        if "delete_confirm" not in st.session_state:
+            st.session_state["delete_confirm"] = False
 
-        with colB:
-            if st.button("🗑️ Apagar mês selecionado"):
-                st.session_state["confirm_delete"] = {"open": True, "mes": mes_sel, "apt_id": apt_id}
+        st.write(f"Você selecionou: **{mes_to_display(mes_sel)}**")
+        st.session_state["delete_confirm"] = st.checkbox("Tenho certeza que quero apagar este mês (ação irreversível).")
 
-        conf = st.session_state["confirm_delete"]
-        if conf["open"] and conf["mes"] == mes_sel and conf["apt_id"] == apt_id:
-            st.warning(f"Tem certeza que deseja apagar **{mes_to_display(mes_sel)}** do histórico? Essa ação não pode ser desfeita.")
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("✅ Sim, apagar agora"):
-                    delete_lancamento(apt_id, mes_sel)
-                    st.session_state["confirm_delete"] = {"open": False, "mes": None, "apt_id": None}
-                    # se apagar o mês que estava marcado como "salvo", invalida
-                    if st.session_state.get("last_saved_key", "").startswith(f"{apt_id}|{mes_sel}|"):
-                        st.session_state["last_saved_key"] = None
-                    st.success("Mês apagado com sucesso.")
-                    st.rerun()
-            with c2:
-                if st.button("❌ Cancelar"):
-                    st.session_state["confirm_delete"] = {"open": False, "mes": None, "apt_id": None}
-                    st.info("Ação cancelada.")
+        if st.button("Apagar mês selecionado", type="primary"):
+            if not st.session_state["delete_confirm"]:
+                st.error("Marque a checkbox confirmando que você tem certeza.")
+            else:
+                delete_lancamento(apt_id, mes_sel)
+                # segurança: invalida qualquer "salvo antes do pdf"
+                st.session_state["last_saved_key"] = ""
+                st.session_state["delete_confirm"] = False
+                st.success("Mês apagado com sucesso.")
+                st.rerun()
