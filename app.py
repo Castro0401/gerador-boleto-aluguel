@@ -28,7 +28,7 @@ def security_gate():
     st.title("🔒 Acesso restrito")
     st.write("Digite os **3 primeiros dígitos do CPF** para acessar.")
 
-    code = st.text_input("Senha (3 dígitos)", max_chars=3, type="password", placeholder="Ex: 133")
+    code = st.text_input("Senha (3 dígitos)", max_chars=3, type="password", placeholder="Ex: 123")
 
     col1, col2 = st.columns(2)
     with col1:
