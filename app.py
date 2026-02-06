@@ -11,12 +11,10 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 
-
 # =========================================
 # CONFIG INICIAL DO STREAMLIT (UMA VEZ SÓ!)
 # =========================================
 st.set_page_config(page_title="Cobrança de Aluguel", page_icon="🧾", layout="centered")
-
 
 # -----------------------------
 # Segurança (gate)
@@ -122,6 +120,15 @@ def colnames(cur, table: str) -> list:
     return [c[1] for c in cur.fetchall()]
 
 
+def ensure_column(cur, table: str, col: str, ddl_type: str, default_sql: str = None):
+    cols = colnames(cur, table)
+    if col not in cols:
+        if default_sql is None:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl_type}")
+        else:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl_type} DEFAULT {default_sql}")
+
+
 def init_db():
     """
     Cria o modelo novo e MIGRA automaticamente se detectar DB antigo no Streamlit Cloud.
@@ -135,6 +142,7 @@ def init_db():
             if "apartamento_id" not in cols:
                 cur.execute("ALTER TABLE lancamentos RENAME TO lancamentos_old")
 
+                # cria a tabela nova (com apt + obs)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS lancamentos (
                         apartamento_id INTEGER NOT NULL,
@@ -169,12 +177,15 @@ def init_db():
                 """)
 
                 old_cols = colnames(cur, "lancamentos_old")
-                def has(c): return c in old_cols
+
+                def has(c): 
+                    return c in old_cols
 
                 consumo_expr = "consumo_agua" if has("consumo_agua") else ("taxa_admin" if has("taxa_admin") else "0")
                 desconto_expr = "outros_descontos" if has("outros_descontos") else ("desconto" if has("desconto") else "0")
                 seguro_expr = "seguro_incendio" if has("seguro_incendio") else "0"
 
+                # migra tudo para o apartamento 1
                 cur.execute(f"""
                     INSERT INTO lancamentos (
                         apartamento_id, mes,
@@ -192,8 +203,52 @@ def init_db():
                         '', '', '', '', '', '', ''
                     FROM lancamentos_old
                 """)
-                cur.execute("DROP TABLE lancancamentos_old".replace("lancancamentos", "lancamentos"))  # só pra garantir sem erro de digitação
-                # (linha acima vira: DROP TABLE lancamentos_old)
+
+                cur.execute("DROP TABLE IF EXISTS lancamentos_old")
+
+        # ✅ CRIA A TABELA lancamentos MESMO EM DB NOVO (era o bug!)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS lancamentos (
+                apartamento_id INTEGER NOT NULL,
+                mes TEXT NOT NULL,
+
+                aluguel REAL DEFAULT 0,
+                aluguel_obs TEXT DEFAULT '',
+
+                condominio REAL DEFAULT 0,
+                condominio_obs TEXT DEFAULT '',
+
+                iptu REAL DEFAULT 0,
+                iptu_obs TEXT DEFAULT '',
+
+                consumo_agua REAL DEFAULT 0,
+                consumo_agua_obs TEXT DEFAULT '',
+
+                seguro_incendio REAL DEFAULT 0,
+                seguro_incendio_obs TEXT DEFAULT '',
+
+                outras_taxas REAL DEFAULT 0,
+                outras_taxas_obs TEXT DEFAULT '',
+
+                outros_descontos REAL DEFAULT 0,
+                outros_descontos_obs TEXT DEFAULT '',
+
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
+
+                PRIMARY KEY (apartamento_id, mes)
+            )
+        """)
+
+        # Migração leve: se a tabela existe mas faltam colunas novas
+        ensure_column(cur, "lancamentos", "aluguel_obs", "TEXT", "''")
+        ensure_column(cur, "lancamentos", "condominio_obs", "TEXT", "''")
+        ensure_column(cur, "lancamentos", "iptu_obs", "TEXT", "''")
+        ensure_column(cur, "lancamentos", "consumo_agua_obs", "TEXT", "''")
+        ensure_column(cur, "lancamentos", "seguro_incendio_obs", "TEXT", "''")
+        ensure_column(cur, "lancamentos", "outras_taxas_obs", "TEXT", "''")
+        ensure_column(cur, "lancamentos", "outros_descontos_obs", "TEXT", "''")
+        ensure_column(cur, "lancamentos", "updated_at", "TEXT", "(datetime('now'))")
 
         # --- Tabelas principais ---
         cur.execute("""
@@ -225,10 +280,14 @@ def init_db():
         """)
 
         # seed 2 imóveis
-        cur.execute("INSERT OR IGNORE INTO apartamentos (id, apelido, imovel, bairro) VALUES (?, ?, ?, ?)",
-                    (APT1_ID, APT1_APELIDO, APT1_IMOVEL_DEFAULT, APT1_BAIRRO_DEFAULT))
-        cur.execute("INSERT OR IGNORE INTO apartamentos (id, apelido, imovel, bairro) VALUES (?, ?, ?, ?)",
-                    (APT2_ID, APT2_APELIDO, APT2_IMOVEL_DEFAULT, APT2_BAIRRO_DEFAULT))
+        cur.execute(
+            "INSERT OR IGNORE INTO apartamentos (id, apelido, imovel, bairro) VALUES (?, ?, ?, ?)",
+            (APT1_ID, APT1_APELIDO, APT1_IMOVEL_DEFAULT, APT1_BAIRRO_DEFAULT)
+        )
+        cur.execute(
+            "INSERT OR IGNORE INTO apartamentos (id, apelido, imovel, bairro) VALUES (?, ?, ?, ?)",
+            (APT2_ID, APT2_APELIDO, APT2_IMOVEL_DEFAULT, APT2_BAIRRO_DEFAULT)
+        )
 
         # configs
         cur.execute("INSERT OR IGNORE INTO configs (apartamento_id, vencimento_dia) VALUES (?, 5)", (APT1_ID,))
@@ -383,7 +442,6 @@ def upsert_lancamento(apt_id: int, mes: str, data: dict):
         cur.execute("""
             INSERT INTO lancamentos (
                 apartamento_id, mes,
-
                 aluguel, aluguel_obs,
                 condominio, condominio_obs,
                 iptu, iptu_obs,
@@ -406,29 +464,21 @@ def upsert_lancamento(apt_id: int, mes: str, data: dict):
             ON CONFLICT(apartamento_id, mes) DO UPDATE SET
                 aluguel=excluded.aluguel,
                 aluguel_obs=excluded.aluguel_obs,
-
                 condominio=excluded.condominio,
                 condominio_obs=excluded.condominio_obs,
-
                 iptu=excluded.iptu,
                 iptu_obs=excluded.iptu_obs,
-
                 consumo_agua=excluded.consumo_agua,
                 consumo_agua_obs=excluded.consumo_agua_obs,
-
                 seguro_incendio=excluded.seguro_incendio,
                 seguro_incendio_obs=excluded.seguro_incendio_obs,
-
                 outras_taxas=excluded.outras_taxas,
                 outras_taxas_obs=excluded.outras_taxas_obs,
-
                 outros_descontos=excluded.outros_descontos,
                 outros_descontos_obs=excluded.outros_descontos_obs,
-
                 updated_at=datetime('now')
         """, (
             apt_id, mes,
-
             float(data.get("aluguel", 0.0)), data.get("aluguel_obs", "") or "",
             float(data.get("condominio", 0.0)), data.get("condominio_obs", "") or "",
             float(data.get("iptu", 0.0)), data.get("iptu_obs", "") or "",
@@ -523,27 +573,35 @@ def generate_pdf_bytes(apto: dict, cfg: dict, lanc: dict) -> bytes:
     elements.append(Spacer(1, 14))
 
     table_data = [
-        ["Descrição", "Observação", "Valor (R$)"],
-        ["Aluguel Mensal", lanc.get("aluguel_obs", ""), brl(aluguel)],
-        ["Condomínio", lanc.get("condominio_obs", ""), brl(condominio)],
-        ["IPTU (parcela mensal)", lanc.get("iptu_obs", ""), brl(iptu)],
-        ["Consumo de água", lanc.get("consumo_agua_obs", ""), brl(consumo_agua)],
-        ["Seguro de incêndio", lanc.get("seguro_incendio_obs", ""), brl(seguro_incendio)],
-        ["Outras taxas", lanc.get("outras_taxas_obs", ""), brl(outras)],
-        ["Subtotal", "", brl(subtotal)],
-        ["Outros Descontos", lanc.get("outros_descontos_obs", ""), brl(outros_descontos)],
-        ["TOTAL A PAGAR", "", brl(total)],
-    ]
+    ["Descrição", "Valor (R$)", "Observação"],
+    ["Aluguel Mensal", brl(aluguel), lanc.get("aluguel_obs", "")],
+    ["Condomínio", brl(condominio), lanc.get("condominio_obs", "")],
+    ["IPTU (parcela mensal)", brl(iptu), lanc.get("iptu_obs", "")],
+    ["Consumo de água", brl(consumo_agua), lanc.get("consumo_agua_obs", "")],
+    ["Seguro de incêndio", brl(seguro_incendio), lanc.get("seguro_incendio_obs", "")],
+    ["Outras taxas", brl(outras), lanc.get("outras_taxas_obs", "")],
+    ["Subtotal", brl(subtotal), ""],
+    ["Outros Descontos", brl(outros_descontos), lanc.get("outros_descontos_obs", "")],
+    ["TOTAL A PAGAR", brl(total), ""],
+]
 
-    t = Table(table_data, colWidths=[170, 200, 90])
+
+    t = Table(table_data, colWidths=[220, 90, 150])  # descrição | valor | obs
     t.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.8, colors.black),
         ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-        ("ALIGN", (2, 1), (2, -1), "RIGHT"),
+
+        # Alinha a coluna de valor à direita
+        ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+
+        # Obs alinhada à esquerda (natural)
+        ("ALIGN", (2, 1), (2, -1), "LEFT"),
+
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]))
+
     elements.append(t)
     elements.append(Spacer(1, 14))
 
@@ -558,7 +616,7 @@ def generate_pdf_bytes(apto: dict, cfg: dict, lanc: dict) -> bytes:
     Tipo: {cfg.get("tipo_conta") or ""}<br/>
     Titular: {cfg.get("titular") or ""}<br/>
     CPF/CNPJ: {cfg.get("titular_doc") or ""}<br/>
-    PIX (se houver): {cfg.get("pix") or ""}
+    PIX : {cfg.get("pix") or ""}
     """
     elements.append(Paragraph(pagamento, styles["Normal"]))
     elements.append(Spacer(1, 10))
@@ -581,13 +639,8 @@ init_db()
 
 st.title("🧾 Gerador de Demonstrativo de Aluguel")
 
-# Sidebar: escolher entre os 2 imóveis fixos
 st.sidebar.header("🏠 Selecionar imóvel")
-
-apt_map = {
-    APT1_APELIDO: APT1_ID,
-    APT2_APELIDO: APT2_ID,
-}
+apt_map = {APT1_APELIDO: APT1_ID, APT2_APELIDO: APT2_ID}
 
 if "apt_id" not in st.session_state:
     st.session_state["apt_id"] = APT1_ID
@@ -611,14 +664,11 @@ if st.sidebar.button("🚪 Sair"):
 
 st.caption(f"Imóvel ativo: **{apelido_sel}**")
 
-# controle "salvou antes do PDF"
 if "last_saved_key" not in st.session_state:
-    st.session_state["last_saved_key"] = ""  # string vazia, nunca None
+    st.session_state["last_saved_key"] = ""
 
 tab1, tab2, tab3 = st.tabs(["⚙️ Fixos (Config)", "🗓️ Mês (Valores)", "📚 Histórico"])
 
-
-# -------- Fixos
 with tab1:
     st.subheader("Informações fixas (por imóvel)")
 
@@ -645,7 +695,9 @@ with tab1:
         with colD:
             locatario_doc = st.text_input("Locatário (CPF/CNPJ)", value=cfg.get("locatario_doc") or "")
 
-        vencimento_dia = st.number_input("Dia fixo de vencimento", min_value=1, max_value=28, value=int(cfg.get("vencimento_dia") or 5))
+        vencimento_dia = st.number_input(
+            "Dia fixo de vencimento", min_value=1, max_value=28, value=int(cfg.get("vencimento_dia") or 5)
+        )
 
         st.markdown("### Dados para pagamento")
         c1, c2 = st.columns(2)
@@ -679,8 +731,6 @@ with tab1:
             })
             st.success("Configurações salvas!")
 
-
-# -------- Mês (Valores) + OBS + Memória + (OBRIGA salvar antes do PDF)
 with tab2:
     st.subheader("Valores do mês")
 
@@ -766,8 +816,6 @@ with tab2:
                     mime="application/pdf"
                 )
 
-
-# -------- Histórico + APAGAR (refeito)
 with tab3:
     st.subheader("Histórico de meses (por imóvel)")
     rows = list_lancamentos(apt_id)
@@ -777,7 +825,10 @@ with tab3:
     else:
         table_rows = []
         for r in rows:
-            subtotal = r["aluguel"] + r["condominio"] + r["iptu"] + r["consumo_agua"] + r["seguro_incendio"] + r["outras_taxas"]
+            subtotal = (
+                r["aluguel"] + r["condominio"] + r["iptu"] +
+                r["consumo_agua"] + r["seguro_incendio"] + r["outras_taxas"]
+            )
             total = subtotal - r["outros_descontos"]
             table_rows.append({
                 "Mês": mes_to_display(r["mes"]),
@@ -813,7 +864,6 @@ with tab3:
         st.divider()
         st.markdown("### 🗑️ Apagar um mês do histórico")
 
-        # estado de confirmação
         if "delete_confirm" not in st.session_state:
             st.session_state["delete_confirm"] = False
 
@@ -825,7 +875,6 @@ with tab3:
                 st.error("Marque a checkbox confirmando que você tem certeza.")
             else:
                 delete_lancamento(apt_id, mes_sel)
-                # segurança: invalida qualquer "salvo antes do pdf"
                 st.session_state["last_saved_key"] = ""
                 st.session_state["delete_confirm"] = False
                 st.success("Mês apagado com sucesso.")
